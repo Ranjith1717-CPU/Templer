@@ -34,10 +34,18 @@ try:
         ConditionalHandler,
         ValidationEngine,
         PatternMatcher,
+        TemplateAnalyzer,
+        ContentType,
+        AnalysisResult,
     )
     TEMPLER_CORE_AVAILABLE = True
 except ImportError:
     TEMPLER_CORE_AVAILABLE = False
+    # Define placeholder classes for type hints
+    class ContentType:
+        STATIC = "static"
+        DYNAMIC_VALUE = "dynamic_value"
+        DYNAMIC_LLM = "dynamic_llm"
 
 # Page configuration
 st.set_page_config(
@@ -467,6 +475,144 @@ def display_confidence_scores(highlights: List[Dict], mappings: Dict[str, str]):
             st.text(f"{status} {item['text']} ({item['confidence']:.0%})")
 
 
+# ============== TEMPLATE ANALYZER HELPERS ==============
+
+def enhance_analysis_with_ai(file_bytes: bytes, analysis) -> 'AnalysisResult':
+    """
+    Use Azure OpenAI to enhance the classification of sections.
+    This improves accuracy for edge cases.
+    """
+    if not TEMPLER_CORE_AVAILABLE:
+        return analysis
+
+    # Extract sample sections for AI review
+    uncertain_sections = [s for s in analysis.sections if 0.3 < s.confidence < 0.7]
+
+    if not uncertain_sections:
+        return analysis
+
+    # Build prompt for AI classification
+    sections_text = []
+    for i, section in enumerate(uncertain_sections[:20]):  # Limit to 20
+        heading = section.heading_context or "No heading"
+        preview = section.text[:200] if len(section.text) > 200 else section.text
+        sections_text.append(f"{i+1}. [Under: {heading}]\n{preview}")
+
+    sections_list = "\n\n".join(sections_text)
+
+    prompt = f'''You are analyzing a financial advisory document template to determine which sections are STATIC (never change) vs DYNAMIC (need to be filled per client).
+
+## CLASSIFICATION RULES:
+- STATIC: Legal disclaimers, compliance text, FCA warnings, generic descriptions, headers, footers
+- DYNAMIC_VALUE: Client names, dates, amounts, percentages, reference numbers
+- DYNAMIC_LLM: Client-specific recommendations, assessments, rationale, personalized advice
+
+## SECTIONS TO CLASSIFY:
+{sections_list}
+
+## OUTPUT FORMAT (JSON):
+Return a JSON object mapping section number to classification:
+{{
+  "1": {{"type": "STATIC", "confidence": 0.9, "reason": "Legal boilerplate"}},
+  "2": {{"type": "DYNAMIC_LLM", "confidence": 0.85, "reason": "Client-specific recommendation"}},
+  ...
+}}
+
+Return ONLY the JSON:'''
+
+    try:
+        response = call_azure_openai(prompt, timeout=60)
+
+        # Parse response
+        json_match = re.search(r'\{[\s\S]*\}', response)
+        if json_match:
+            classifications = json.loads(json_match.group(0))
+
+            # Apply AI classifications back to analysis
+            for i, section in enumerate(uncertain_sections[:20]):
+                key = str(i + 1)
+                if key in classifications:
+                    ai_class = classifications[key]
+                    ai_type = ai_class.get('type', '')
+                    ai_confidence = ai_class.get('confidence', 0.5)
+
+                    # Update section based on AI
+                    if ai_type == 'STATIC':
+                        section.content_type = ContentType.STATIC
+                    elif ai_type == 'DYNAMIC_VALUE':
+                        section.content_type = ContentType.DYNAMIC_VALUE
+                    elif ai_type == 'DYNAMIC_LLM':
+                        section.content_type = ContentType.DYNAMIC_LLM
+
+                    # Boost confidence with AI agreement
+                    section.confidence = min(0.95, (section.confidence + ai_confidence) / 2 + 0.1)
+                    section.reasoning += f" | AI: {ai_class.get('reason', '')}"
+
+    except Exception as e:
+        st.warning(f"AI enhancement skipped: {e}")
+
+    # Recalculate counts
+    analysis.static_count = sum(1 for s in analysis.sections if s.content_type == ContentType.STATIC)
+    analysis.dynamic_value_count = sum(1 for s in analysis.sections if s.content_type == ContentType.DYNAMIC_VALUE)
+    analysis.dynamic_llm_count = sum(1 for s in analysis.sections if s.content_type == ContentType.DYNAMIC_LLM)
+
+    return analysis
+
+
+def generate_analysis_report(analysis) -> str:
+    """Generate a markdown report of the template analysis."""
+    report = f"""# Template Analysis Report
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Summary
+- **Template Type:** {analysis.template_type.replace('_', ' ').title()}
+- **Overall Confidence:** {analysis.overall_confidence:.0%}
+- **Total Sections Analyzed:** {len(analysis.sections)}
+
+## Section Breakdown
+| Type | Count | Percentage |
+|------|-------|------------|
+| Static | {analysis.static_count} | {analysis.static_count/max(1,len(analysis.sections))*100:.0f}% |
+| Dynamic Values | {analysis.dynamic_value_count} | {analysis.dynamic_value_count/max(1,len(analysis.sections))*100:.0f}% |
+| LLM Generated | {analysis.dynamic_llm_count} | {analysis.dynamic_llm_count/max(1,len(analysis.sections))*100:.0f}% |
+
+## Placeholders Created
+
+"""
+
+    # List dynamic placeholders
+    placeholders = analysis.get_placeholders()
+    for name, hint in placeholders.items():
+        report += f"### `{{{{{name}}}}}`\n"
+        report += f"- **Prompt Hint:** {hint}\n\n"
+
+    # List LLM sections
+    llm_sections = [s for s in analysis.sections if s.content_type == ContentType.DYNAMIC_LLM]
+    if llm_sections:
+        report += "\n## LLM-Generated Sections (Require Prompt Engineering)\n\n"
+        for section in llm_sections:
+            report += f"### {section.placeholder_name or 'Unnamed'}\n"
+            report += f"- **Confidence:** {section.confidence:.0%}\n"
+            report += f"- **Heading:** {section.heading_context or 'None'}\n"
+            report += f"- **Prompt Hint:** {section.prompt_hint or 'Generate appropriate content'}\n"
+            report += f"- **Sample Text:** {section.text[:150]}...\n\n"
+
+    # Instructions
+    report += """
+## Next Steps
+
+1. **Review the classifications** - Check if static/dynamic labels are correct
+2. **Download the template with placeholders** - Use this as your output template
+3. **Use the prompt configuration** - Configure your LLM prompts for each dynamic section
+4. **Test with sample data** - Use the 'Auto-Detect & Fill' mode to test
+
+---
+*Generated by Templer v2.0 - Template Intelligence Engine*
+"""
+
+    return report
+
+
 # ============== MAIN APPLICATION ==============
 
 def main():
@@ -474,12 +620,13 @@ def main():
     st.markdown("**Template Intelligence Engine** | Zero-prep template processing with auto-detection")
 
     # Mode selector
-    st.sidebar.header("🎛️ Detection Mode")
+    st.sidebar.header("🎛️ Mode")
 
     mode = st.sidebar.radio(
-        "Choose how to detect template fields:",
+        "Choose operation mode:",
         [
-            "🔍 Auto-Detect (Recommended)",
+            "🔧 Analyze & Create Template",
+            "🔍 Auto-Detect & Fill",
             "📚 Learn from Example",
             "🖍️ Manual Highlights (Original)"
         ],
@@ -488,7 +635,8 @@ def main():
 
     # Show mode description
     mode_descriptions = {
-        "🔍 Auto-Detect (Recommended)": "Automatically finds insertion points using pattern matching and AI. **No template preparation needed.**",
+        "🔧 Analyze & Create Template": "**NEW!** Upload a raw template → AI identifies static vs dynamic sections → Outputs template with {{placeholders}}. **Solves the 4-hour setup problem.**",
+        "🔍 Auto-Detect & Fill": "Automatically finds insertion points using pattern matching and AI. **No template preparation needed.**",
         "📚 Learn from Example": "Upload a blank template + filled example pair. System learns what to replace.",
         "🖍️ Manual Highlights (Original)": "Use highlighted text in your template as placeholders (original Templer behavior)."
     }
@@ -507,12 +655,223 @@ def main():
         st.session_state.highlights = []
     if 'learned_schema' not in st.session_state:
         st.session_state.learned_schema = None
+    if 'analyzed_template' not in st.session_state:
+        st.session_state.analyzed_template = None
+    if 'analysis_result' not in st.session_state:
+        st.session_state.analysis_result = None
+    if 'prompt_config' not in st.session_state:
+        st.session_state.prompt_config = None
 
     # Azure status
     with st.sidebar.expander("☁️ Azure OpenAI", expanded=False):
         st.success(f"**Connected** | {AZURE_DEPLOYMENT}")
 
     st.divider()
+
+    # ============== ANALYZE & CREATE TEMPLATE MODE ==============
+    if mode == "🔧 Analyze & Create Template":
+        st.subheader("🔧 Template Analyzer")
+        st.markdown("""
+        **Upload a raw template** (firm's approved Word doc with no placeholders) and the AI will:
+        1. Identify **static sections** (legal, headers, boilerplate)
+        2. Identify **dynamic sections** (client names, recommendations, assessments)
+        3. Create a **new template with {{placeholders}}** inserted
+        4. Generate **prompt hints** for LLM-generated sections
+
+        **This turns a 4-hour manual process into minutes of review.**
+        """)
+
+        st.divider()
+
+        # File upload for raw template
+        st.markdown("**📄 Upload Raw Template**")
+        raw_template = st.file_uploader(
+            "Upload the firm's template (no placeholders needed)",
+            type=['docx'],
+            key="raw_template",
+            label_visibility="collapsed"
+        )
+
+        if raw_template:
+            st.success(f"✅ {raw_template.name}")
+
+            # Analysis options
+            with st.expander("⚙️ Analysis Options", expanded=False):
+                use_ai_classification = st.checkbox(
+                    "Use AI for enhanced classification",
+                    value=True,
+                    help="Uses Azure OpenAI to improve static/dynamic classification accuracy"
+                )
+                include_tables = st.checkbox(
+                    "Analyze tables separately",
+                    value=True,
+                    help="Identify table headers vs data rows for proper handling"
+                )
+
+            if st.button("🔬 Analyze Template", type="primary", use_container_width=True):
+                progress = st.progress(0)
+                status = st.empty()
+
+                try:
+                    status.text("📖 Reading template...")
+                    progress.progress(10)
+
+                    raw_bytes = raw_template.read()
+                    raw_template.seek(0)
+
+                    if TEMPLER_CORE_AVAILABLE:
+                        status.text("🔬 Analyzing document structure...")
+                        progress.progress(30)
+
+                        analyzer = TemplateAnalyzer()
+                        analysis = analyzer.analyze_template(raw_bytes)
+
+                        progress.progress(50)
+
+                        # If AI classification enabled, enhance with LLM
+                        if use_ai_classification:
+                            status.text("🧠 AI is classifying sections...")
+                            analysis = enhance_analysis_with_ai(raw_bytes, analysis)
+
+                        progress.progress(70)
+
+                        status.text("📝 Generating template with placeholders...")
+
+                        # Generate the new template
+                        new_template_bytes = analyzer.generate_template(raw_bytes, analysis)
+
+                        # Generate prompt config
+                        prompt_config = analyzer.generate_prompt_config(analysis)
+
+                        progress.progress(90)
+
+                        # Store in session state
+                        st.session_state.analyzed_template = new_template_bytes
+                        st.session_state.analysis_result = analysis
+                        st.session_state.prompt_config = prompt_config
+
+                        progress.progress(100)
+                        status.text("✅ Analysis complete!")
+
+                    else:
+                        st.error("⚠️ Template Analyzer requires templer_core module")
+
+                except Exception as e:
+                    st.error(f"❌ Error analyzing template: {e}")
+
+        # Show analysis results
+        if st.session_state.analysis_result:
+            analysis = st.session_state.analysis_result
+
+            st.divider()
+            st.subheader("📊 Analysis Results")
+
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Static Sections", analysis.static_count)
+            with col2:
+                st.metric("Dynamic Values", analysis.dynamic_value_count)
+            with col3:
+                st.metric("LLM Sections", analysis.dynamic_llm_count)
+            with col4:
+                st.metric("Confidence", f"{analysis.overall_confidence:.0%}")
+
+            # Template type
+            st.info(f"📋 **Detected Template Type:** {analysis.template_type.replace('_', ' ').title()}")
+
+            # Detailed breakdown
+            with st.expander("📝 Section-by-Section Analysis", expanded=True):
+                # Filter options
+                show_filter = st.radio(
+                    "Show:",
+                    ["All", "Dynamic Only", "Static Only"],
+                    horizontal=True
+                )
+
+                for i, section in enumerate(analysis.sections[:50]):  # Limit to 50
+                    if show_filter == "Dynamic Only" and section.content_type == ContentType.STATIC:
+                        continue
+                    if show_filter == "Static Only" and section.content_type != ContentType.STATIC:
+                        continue
+
+                    # Color coding
+                    if section.content_type == ContentType.STATIC:
+                        color = "🔵"
+                        badge = "STATIC"
+                    elif section.content_type == ContentType.DYNAMIC_VALUE:
+                        color = "🟢"
+                        badge = f"DYNAMIC ({section.value_type})"
+                    elif section.content_type == ContentType.DYNAMIC_LLM:
+                        color = "🟠"
+                        badge = "LLM GENERATED"
+                    else:
+                        color = "⚪"
+                        badge = str(section.content_type.value)
+
+                    with st.container():
+                        col1, col2 = st.columns([4, 1])
+                        with col1:
+                            preview = section.text[:150] + "..." if len(section.text) > 150 else section.text
+                            st.markdown(f"{color} **{badge}** ({section.confidence:.0%})")
+                            st.text(preview)
+                            if section.placeholder_name:
+                                st.caption(f"Placeholder: `{{{{{section.placeholder_name}}}}}`")
+                        with col2:
+                            if section.heading_context:
+                                st.caption(f"Under: {section.heading_context[:30]}")
+                        st.markdown("---")
+
+            # Prompt configuration
+            if st.session_state.prompt_config:
+                with st.expander("🤖 LLM Prompt Configuration", expanded=False):
+                    st.json(st.session_state.prompt_config)
+
+            # Download section
+            st.divider()
+            st.subheader("📥 Download Results")
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                if st.session_state.analyzed_template:
+                    filename = f"Template_With_Placeholders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+                    st.download_button(
+                        "📄 Download Template with Placeholders",
+                        st.session_state.analyzed_template,
+                        filename,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        type="primary",
+                        use_container_width=True
+                    )
+
+            with col2:
+                if st.session_state.prompt_config:
+                    config_json = json.dumps(st.session_state.prompt_config, indent=2)
+                    st.download_button(
+                        "📋 Download Prompt Config (JSON)",
+                        config_json,
+                        f"prompt_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        "application/json",
+                        use_container_width=True
+                    )
+
+            with col3:
+                # Generate analysis report
+                report = generate_analysis_report(analysis)
+                st.download_button(
+                    "📊 Download Analysis Report",
+                    report,
+                    f"analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                    "text/markdown",
+                    use_container_width=True
+                )
+
+            # Option to proceed to fill mode
+            st.divider()
+            st.info("💡 **Next Step:** Use the generated template with the **'Auto-Detect & Fill'** mode to fill it with client data!")
+
+        return  # Exit main() early for this mode
 
     # ============== LEARNING MODE UI ==============
     if mode == "📚 Learn from Example":
@@ -642,7 +1001,7 @@ def main():
             _, template_xml, template_bytes = read_word_document(template_file)
 
             # Choose detection method based on mode
-            if mode == "🔍 Auto-Detect (Recommended)":
+            if mode == "🔍 Auto-Detect & Fill":
                 log("Using auto-detection mode...")
                 highlights = auto_detect_insertion_points(template_bytes)
 

@@ -38,15 +38,37 @@ When a new advisory firm signs up with five different report templates—pension
 
 ## What's New in v2.0
 
-### Three Detection Modes
+### Four Operation Modes
 
 | Mode | Description | Best For |
 |------|-------------|----------|
-| 🔍 **Auto-Detect** | Automatically finds insertion points using patterns & AI | New templates with no preparation |
+| 🔧 **Analyze & Create Template** | **NEW!** Upload raw template → AI identifies static vs dynamic → Creates template with placeholders | **Solving the 4-hour setup problem** |
+| 🔍 **Auto-Detect & Fill** | Automatically finds insertion points using patterns & AI | Filling templates with data |
 | 📚 **Learn from Example** | Upload blank + filled pair, system learns what changes | Compliance-approved templates |
 | 🖍️ **Manual Highlights** | Original behavior - use highlighted text | Legacy templates |
 
-### Key Capabilities
+### Key Feature: Template Analyzer (NEW!)
+
+The **Analyze & Create Template** mode solves the core problem:
+
+```
+RAW TEMPLATE (firm's Word doc)           OUTPUT TEMPLATE (ready for use)
+┌──────────────────────────────┐         ┌──────────────────────────────┐
+│ Dear John Smith,             │    →    │ Dear {{client_name}},        │
+│ We recommend transferring    │    →    │ {{LLM:recommendation}}       │
+│ £150,000 from your pension   │    →    │ {{pension_value}} from your  │
+│ Risk Warning: Past...        │    →    │ Risk Warning: Past...        │
+└──────────────────────────────┘         └──────────────────────────────┘
+        4 hours manual                           5 minutes review
+```
+
+**What it does:**
+1. **Classifies content**: Static (legal, boilerplate) vs Dynamic (client data, recommendations)
+2. **Inserts placeholders**: `{{client_name}}`, `{{LLM:recommendation}}`, etc.
+3. **Generates prompt hints**: For each LLM-generated section
+4. **Creates downloadable template**: Ready for production use
+
+### Other Key Capabilities
 
 - **Zero Template Preparation**: Upload any Word template, system detects fields automatically
 - **Pattern Recognition**: Finds `{{placeholders}}`, dates, currencies, names, percentages
@@ -65,6 +87,18 @@ When a new advisory firm signs up with five different report templates—pension
 │                    TEMPLER v2.0 ARCHITECTURE                    │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
+│  MODE 1: ANALYZE & CREATE TEMPLATE (Solves 4-hour problem)      │
+│  ─────────────────────────────────────────────────────────────  │
+│  Raw Template ──► Template Analyzer ──► Static/Dynamic Classify │
+│                         │                        │              │
+│                         ▼                        ▼              │
+│              Placeholder Insertion    Prompt Config Generation  │
+│                         │                        │              │
+│                         ▼                        ▼              │
+│              Output Template.docx     prompt_config.json        │
+│                                                                 │
+│  MODE 2-4: FILL TEMPLATE (Using prepared template)              │
+│  ─────────────────────────────────────────────────────────────  │
 │  Template Input ──┬──► Auto-Detection Engine                    │
 │                   ├──► Learning Engine (blank + filled pair)    │
 │                   └──► Manual Highlights (fallback)             │
