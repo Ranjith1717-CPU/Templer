@@ -11,7 +11,7 @@ from .table_processor import TableProcessor, TableStructure
 from .format_preserver import FormatPreserver
 from .conditionals import ConditionalHandler
 from .validation import ValidationEngine
-from .template_analyzer import TemplateAnalyzer, ContentType, AnalysisResult
+from .template_analyzer import TemplateAnalyzer, ContentType, AnalysisResult, DynamicValue
 
 __version__ = "2.0.0"
 __all__ = [

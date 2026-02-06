@@ -28,6 +28,17 @@ class ContentType(Enum):
 
 
 @dataclass
+class DynamicValue:
+    """Represents a specific dynamic value found in the document"""
+    original_text: str           # The actual text found (e.g., "John Smith")
+    placeholder_name: str        # Generated placeholder name (e.g., "client_name")
+    value_type: str             # Type: name, date, currency, percentage, etc.
+    context: str                # Surrounding context (e.g., "Client Name:")
+    confidence: float           # Detection confidence
+    position: int               # Position in document
+
+
+@dataclass
 class AnalyzedSection:
     """Represents an analyzed section of the document"""
     text: str
@@ -38,15 +49,14 @@ class AnalyzedSection:
     reasoning: str = ""
     position: int = 0
     heading_context: Optional[str] = None
-
-    # For dynamic values
-    value_type: Optional[str] = None  # name, date, currency, percentage, etc.
+    value_type: Optional[str] = None
 
 
 @dataclass
 class AnalysisResult:
     """Complete analysis result for a template"""
     sections: List[AnalyzedSection] = field(default_factory=list)
+    dynamic_values: List[DynamicValue] = field(default_factory=list)  # NEW: specific values to replace
     static_count: int = 0
     dynamic_value_count: int = 0
     dynamic_llm_count: int = 0
@@ -58,11 +68,13 @@ class AnalysisResult:
 
     def get_placeholders(self) -> Dict[str, str]:
         """Get mapping of placeholder names to prompt hints"""
-        return {
-            s.placeholder_name: s.prompt_hint or s.text[:50]
-            for s in self.sections
-            if s.placeholder_name
-        }
+        result = {}
+        for s in self.sections:
+            if s.placeholder_name:
+                result[s.placeholder_name] = s.prompt_hint or s.text[:50]
+        for v in self.dynamic_values:
+            result[v.placeholder_name] = f"Extract {v.value_type} from input (example: {v.original_text})"
+        return result
 
 
 class TemplateAnalyzer:
@@ -74,6 +86,48 @@ class TemplateAnalyzer:
     - We need to figure out what stays the same vs what changes per client
     - Output a template with proper placeholders
     """
+
+    # Regex patterns for detecting dynamic values
+    DYNAMIC_PATTERNS = {
+        'currency': [
+            (r'[£$€]\s*[\d,]+(?:\.\d{2})?', 'currency'),
+            (r'(?:GBP|USD|EUR)\s*[\d,]+(?:\.\d{2})?', 'currency'),
+        ],
+        'percentage': [
+            (r'[+-]?\d+\.?\d*\s*%', 'percentage'),
+        ],
+        'date': [
+            (r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', 'date'),
+            (r'\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}', 'date'),
+            (r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}', 'date'),
+        ],
+        'email': [
+            (r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', 'email'),
+        ],
+        'phone': [
+            (r'(?:\+44|0)\s*\d{2,4}\s*\d{3,4}\s*\d{3,4}', 'phone'),
+            (r'\(\d{3}\)\s*\d{3}[-.\s]?\d{4}', 'phone'),
+        ],
+        'reference': [
+            (r'(?:Policy|Account|Reference|Ref|ID|SIPP|ISA)[:\s#]*([A-Z0-9][\w\-]{3,20})', 'reference'),
+        ],
+    }
+
+    # Context patterns that indicate a name follows
+    NAME_CONTEXT_PATTERNS = [
+        (r'(?:Dear|Mr\.?|Mrs\.?|Ms\.?|Dr\.?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})', 'client_name'),
+        (r'(?:Client|Customer|Name|Applicant|Investor)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})', 'client_name'),
+        (r'(?:Adviser|Advisor|Prepared by|Author)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})', 'adviser_name'),
+    ]
+
+    # Context patterns for specific value types
+    VALUE_CONTEXT_PATTERNS = [
+        (r'(?:pension|SIPP|personal pension)[^£$€\d]*([£$€]\s*[\d,]+(?:\.\d{2})?)', 'pension_value'),
+        (r'(?:ISA|stocks and shares ISA)[^£$€\d]*([£$€]\s*[\d,]+(?:\.\d{2})?)', 'isa_value'),
+        (r'(?:portfolio|investment|fund value|total value)[^£$€\d]*([£$€]\s*[\d,]+(?:\.\d{2})?)', 'portfolio_value'),
+        (r'(?:transfer|transferring)[^£$€\d]*([£$€]\s*[\d,]+(?:\.\d{2})?)', 'transfer_amount'),
+        (r'(?:contribution|investing)[^£$€\d]*([£$€]\s*[\d,]+(?:\.\d{2})?)', 'contribution_amount'),
+    ]
 
     # Keywords indicating STATIC content (legal, compliance, boilerplate)
     STATIC_INDICATORS = {
@@ -90,67 +144,23 @@ class TemplateAnalyzer:
             'this document', 'for professional', 'not intended',
             'seek advice', 'independent advice',
         ],
-        'headers': [
-            'contents', 'table of contents', 'appendix', 'appendices',
-            'page', 'document reference', 'version',
-        ],
     }
 
-    # Keywords indicating DYNAMIC content that needs LLM generation
-    DYNAMIC_LLM_INDICATORS = {
-        'recommendations': [
-            'recommendation', 'we recommend', 'our advice', 'suggest',
-            'proposed', 'action', 'next steps', 'going forward',
-        ],
-        'assessments': [
-            'assessment', 'analysis', 'evaluation', 'review of',
-            'risk profile', 'attitude to risk', 'capacity for loss',
-            'suitability', 'appropriateness',
-        ],
-        'rationale': [
-            'rationale', 'reasoning', 'because', 'therefore',
-            'as a result', 'given your', 'based on your',
-            'considering your', 'taking into account',
-        ],
-        'circumstances': [
-            'your circumstances', 'your situation', 'personal details',
-            'your objectives', 'your goals', 'your needs',
-            'financial position', 'current position',
-        ],
-        'summary': [
-            'executive summary', 'summary', 'overview', 'key points',
-            'highlights', 'in summary',
-        ],
-    }
-
-    # Headings that typically contain dynamic LLM content
-    DYNAMIC_HEADINGS = [
-        'recommendation', 'advice', 'assessment', 'analysis',
-        'suitability', 'rationale', 'summary', 'overview',
-        'circumstances', 'objectives', 'goals', 'position',
-        'review', 'commentary', 'discussion', 'conclusion',
-    ]
-
-    # Headings that typically contain static content
-    STATIC_HEADINGS = [
-        'disclaimer', 'important information', 'risk warning',
-        'terms', 'conditions', 'legal', 'regulatory',
-        'about us', 'contact', 'appendix', 'glossary',
-        'definitions', 'notes', 'references',
+    # Keywords indicating DYNAMIC LLM content
+    DYNAMIC_LLM_INDICATORS = [
+        'recommendation', 'we recommend', 'our advice', 'suggest',
+        'assessment', 'analysis', 'evaluation', 'review of',
+        'rationale', 'reasoning', 'because', 'therefore',
+        'your circumstances', 'your situation', 'your objectives',
     ]
 
     def __init__(self):
         self.current_heading = None
+        self.placeholder_counter = {}
 
     def analyze_template(self, file_bytes: bytes) -> AnalysisResult:
         """
         Analyze a raw template to identify static vs dynamic content.
-
-        Args:
-            file_bytes: Raw bytes of the Word document
-
-        Returns:
-            AnalysisResult with classified sections
         """
         result = AnalysisResult()
 
@@ -160,7 +170,10 @@ class TemplateAnalyzer:
         # Detect template type
         result.template_type = self._detect_template_type(full_text)
 
-        # Extract and analyze paragraphs
+        # STEP 1: Find all specific dynamic values (names, dates, amounts, etc.)
+        result.dynamic_values = self._find_dynamic_values(full_text)
+
+        # STEP 2: Analyze paragraphs for LLM sections
         paragraphs = self._extract_paragraphs(document_xml)
 
         position = 0
@@ -185,27 +198,115 @@ class TemplateAnalyzer:
             # Update counts
             if section.content_type == ContentType.STATIC:
                 result.static_count += 1
-            elif section.content_type == ContentType.DYNAMIC_VALUE:
-                result.dynamic_value_count += 1
             elif section.content_type == ContentType.DYNAMIC_LLM:
                 result.dynamic_llm_count += 1
 
+        # Count dynamic values
+        result.dynamic_value_count = len(result.dynamic_values)
+
         # Calculate overall confidence
-        if result.sections:
-            result.overall_confidence = sum(s.confidence for s in result.sections) / len(result.sections)
+        all_confidences = [s.confidence for s in result.sections] + [v.confidence for v in result.dynamic_values]
+        if all_confidences:
+            result.overall_confidence = sum(all_confidences) / len(all_confidences)
 
         return result
 
+    def _find_dynamic_values(self, full_text: str) -> List[DynamicValue]:
+        """
+        Find all specific dynamic values in the document.
+        These are the actual values that need to be replaced with placeholders.
+        """
+        values = []
+        seen_texts = set()
+
+        # Find names with context
+        for pattern, placeholder_base in self.NAME_CONTEXT_PATTERNS:
+            for match in re.finditer(pattern, full_text, re.IGNORECASE):
+                name = match.group(1).strip() if match.lastindex else match.group(0).strip()
+                if name and name not in seen_texts and len(name) > 3:
+                    seen_texts.add(name)
+                    placeholder = self._generate_unique_placeholder(placeholder_base)
+
+                    # Get context
+                    start = max(0, match.start() - 30)
+                    context = full_text[start:match.start()].strip()
+
+                    values.append(DynamicValue(
+                        original_text=name,
+                        placeholder_name=placeholder,
+                        value_type='name',
+                        context=context,
+                        confidence=0.85,
+                        position=match.start()
+                    ))
+
+        # Find values with specific context (pension values, ISA values, etc.)
+        for pattern, placeholder_base in self.VALUE_CONTEXT_PATTERNS:
+            for match in re.finditer(pattern, full_text, re.IGNORECASE):
+                value = match.group(1).strip() if match.lastindex else match.group(0).strip()
+                if value and value not in seen_texts:
+                    seen_texts.add(value)
+                    placeholder = self._generate_unique_placeholder(placeholder_base)
+
+                    start = max(0, match.start() - 50)
+                    context = full_text[start:match.start()].strip()
+
+                    values.append(DynamicValue(
+                        original_text=value,
+                        placeholder_name=placeholder,
+                        value_type='currency',
+                        context=context,
+                        confidence=0.80,
+                        position=match.start()
+                    ))
+
+        # Find generic dynamic patterns (dates, emails, phones, remaining currencies)
+        for pattern_type, patterns in self.DYNAMIC_PATTERNS.items():
+            for pattern, value_type in patterns:
+                for match in re.finditer(pattern, full_text, re.IGNORECASE):
+                    value = match.group(1).strip() if match.lastindex and match.lastindex >= 1 else match.group(0).strip()
+
+                    if value and value not in seen_texts:
+                        # Check if this is in a static section (skip if so)
+                        context_start = max(0, match.start() - 100)
+                        context = full_text[context_start:match.start()].lower()
+
+                        is_static_context = any(
+                            indicator in context
+                            for indicators in self.STATIC_INDICATORS.values()
+                            for indicator in indicators
+                        )
+
+                        if not is_static_context:
+                            seen_texts.add(value)
+                            placeholder = self._generate_unique_placeholder(value_type)
+
+                            values.append(DynamicValue(
+                                original_text=value,
+                                placeholder_name=placeholder,
+                                value_type=value_type,
+                                context=context[-50:].strip(),
+                                confidence=0.75,
+                                position=match.start()
+                            ))
+
+        # Sort by position
+        values.sort(key=lambda v: v.position)
+
+        return values
+
+    def _generate_unique_placeholder(self, base_name: str) -> str:
+        """Generate a unique placeholder name"""
+        if base_name not in self.placeholder_counter:
+            self.placeholder_counter[base_name] = 0
+            return base_name
+        else:
+            self.placeholder_counter[base_name] += 1
+            return f"{base_name}_{self.placeholder_counter[base_name]}"
+
     def generate_template(self, file_bytes: bytes, analysis: AnalysisResult = None) -> bytes:
         """
-        Generate a new template with placeholders inserted.
-
-        Args:
-            file_bytes: Original document bytes
-            analysis: Optional pre-computed analysis
-
-        Returns:
-            New document bytes with placeholders
+        Generate a new template with placeholders inserted for dynamic values.
         """
         if analysis is None:
             analysis = self.analyze_template(file_bytes)
@@ -222,17 +323,24 @@ class TemplateAnalyzer:
                     if item == 'word/document.xml':
                         content = data.decode('utf-8')
 
-                        # Replace dynamic sections with placeholders
-                        for section in analysis.sections:
-                            if section.content_type != ContentType.STATIC and section.placeholder_name:
-                                # Create placeholder text
-                                if section.content_type == ContentType.DYNAMIC_LLM:
-                                    placeholder = f"{{{{LLM:{section.placeholder_name}}}}}"
-                                else:
-                                    placeholder = f"{{{{{section.placeholder_name}}}}}"
+                        # STEP 1: Replace specific dynamic values with placeholders
+                        # Sort by length (longest first) to avoid partial replacements
+                        sorted_values = sorted(analysis.dynamic_values,
+                                              key=lambda v: len(v.original_text),
+                                              reverse=True)
 
-                                # Replace in content (careful with XML)
-                                content = self._safe_replace(content, section.text, placeholder)
+                        for dv in sorted_values:
+                            placeholder = f"{{{{{dv.placeholder_name}}}}}"
+                            # Replace in XML content (handle text split across runs)
+                            content = self._replace_in_xml(content, dv.original_text, placeholder)
+
+                        # STEP 2: Replace LLM sections with placeholders
+                        for section in analysis.sections:
+                            if section.content_type == ContentType.DYNAMIC_LLM and section.placeholder_name:
+                                placeholder = f"{{{{LLM:{section.placeholder_name}}}}}"
+                                # Only replace if the text is substantial
+                                if len(section.text) > 50:
+                                    content = self._replace_in_xml(content, section.text, placeholder)
 
                         data = content.encode('utf-8')
 
@@ -240,40 +348,258 @@ class TemplateAnalyzer:
 
         return output_io.getvalue()
 
-    def generate_prompt_config(self, analysis: AnalysisResult) -> Dict:
+    def _replace_in_xml(self, xml_content: str, old_text: str, new_text: str) -> str:
         """
-        Generate configuration for LLM prompts based on analysis.
+        Replace text in Word XML, handling text split across multiple <w:t> elements.
+        """
+        # Escape the new text for XML
+        escaped_new = self._escape_xml(new_text)
 
-        Returns a config that can be used to drive the LLM generation.
+        # First, try simple replacement within <w:t> tags
+        # Pattern to find text within w:t tags
+        def replace_in_t_tags(content):
+            # Find all <w:t> content and try to replace
+            result = content
+
+            # Direct replacement if the text exists as-is
+            if old_text in self._extract_text_from_xml(content):
+                # Try to find and replace in individual <w:t> elements
+                t_pattern = r'(<w:t[^>]*>)([^<]*)(</w:t>)'
+
+                def replacer(match):
+                    tag_start = match.group(1)
+                    text = match.group(2)
+                    tag_end = match.group(3)
+
+                    if old_text in text:
+                        new_content = text.replace(old_text, escaped_new)
+                        return tag_start + new_content + tag_end
+                    return match.group(0)
+
+                result = re.sub(t_pattern, replacer, result)
+
+            return result
+
+        # Apply the replacement
+        result = replace_in_t_tags(xml_content)
+
+        # If simple replacement didn't work, try handling split runs
+        if old_text in self._extract_text_from_xml(result):
+            result = self._replace_split_text(result, old_text, escaped_new)
+
+        return result
+
+    def _replace_split_text(self, xml_content: str, old_text: str, new_text: str) -> str:
         """
+        Handle text that is split across multiple <w:r> (run) elements.
+        """
+        # Find paragraphs
+        para_pattern = r'(<w:p[^>]*>)(.*?)(</w:p>)'
+
+        def process_paragraph(match):
+            para_start = match.group(1)
+            para_content = match.group(2)
+            para_end = match.group(3)
+
+            # Extract all text from this paragraph
+            full_para_text = self._extract_text_from_xml(para_content)
+
+            if old_text not in full_para_text:
+                return match.group(0)
+
+            # Find the position of the old text
+            text_pos = full_para_text.find(old_text)
+            if text_pos == -1:
+                return match.group(0)
+
+            # Find all runs and their text
+            run_pattern = r'<w:r[^>]*>.*?</w:r>'
+            runs = re.findall(run_pattern, para_content, re.DOTALL)
+
+            # Build mapping of character positions to runs
+            char_pos = 0
+            run_char_ranges = []
+            for run in runs:
+                run_text = self._extract_text_from_xml(run)
+                run_char_ranges.append({
+                    'run': run,
+                    'start': char_pos,
+                    'end': char_pos + len(run_text),
+                    'text': run_text
+                })
+                char_pos += len(run_text)
+
+            # Find which runs contain our target text
+            target_start = text_pos
+            target_end = text_pos + len(old_text)
+
+            affected_runs = []
+            for rcr in run_char_ranges:
+                if rcr['end'] > target_start and rcr['start'] < target_end:
+                    affected_runs.append(rcr)
+
+            if not affected_runs:
+                return match.group(0)
+
+            # Create replacement: use first run's formatting, replace text
+            first_run = affected_runs[0]['run']
+
+            # Extract run properties from first run
+            rpr_match = re.search(r'<w:rPr>.*?</w:rPr>', first_run, re.DOTALL)
+            rpr = rpr_match.group(0) if rpr_match else ''
+
+            # Create new run with replacement text
+            new_run = f'<w:r>{rpr}<w:t>{new_text}</w:t></w:r>'
+
+            # Replace in paragraph content
+            new_para_content = para_content
+
+            # Remove all affected runs except the first, then replace first
+            for i, ar in enumerate(affected_runs):
+                if i == 0:
+                    new_para_content = new_para_content.replace(ar['run'], new_run, 1)
+                else:
+                    new_para_content = new_para_content.replace(ar['run'], '', 1)
+
+            return para_start + new_para_content + para_end
+
+        return re.sub(para_pattern, process_paragraph, xml_content, flags=re.DOTALL)
+
+    def _extract_text_from_xml(self, xml: str) -> str:
+        """Extract plain text from XML"""
+        texts = re.findall(r'<w:t[^>]*>([^<]*)</w:t>', xml)
+        return ''.join(texts)
+
+    def _escape_xml(self, text: str) -> str:
+        """Escape special XML characters"""
+        return (str(text)
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&apos;'))
+
+    def _analyze_paragraph(self, text: str, para_xml: str, position: int) -> AnalyzedSection:
+        """Analyze a single paragraph to classify it"""
+        text_lower = text.lower().strip()
+
+        # Check for static indicators
+        is_static = False
+        for category, keywords in self.STATIC_INDICATORS.items():
+            if any(kw in text_lower for kw in keywords):
+                is_static = True
+                break
+
+        if is_static:
+            return AnalyzedSection(
+                text=text,
+                content_type=ContentType.STATIC,
+                confidence=0.90,
+                reasoning="Contains legal/compliance/boilerplate keywords",
+                position=position,
+            )
+
+        # Check for LLM content indicators
+        is_llm = any(indicator in text_lower for indicator in self.DYNAMIC_LLM_INDICATORS)
+
+        # Also check if paragraph is substantial and contains client-specific language
+        has_client_refs = any(w in text_lower for w in ['you', 'your', 'client'])
+        is_substantial = len(text) > 100
+
+        if is_llm or (has_client_refs and is_substantial):
+            placeholder_name = self._generate_section_placeholder(text)
+            prompt_hint = self._generate_prompt_hint(text)
+
+            return AnalyzedSection(
+                text=text,
+                content_type=ContentType.DYNAMIC_LLM,
+                confidence=0.75 if is_llm else 0.60,
+                placeholder_name=placeholder_name,
+                prompt_hint=prompt_hint,
+                reasoning="Contains recommendation/assessment language or client-specific content",
+                position=position,
+            )
+
+        # Default to static for short or unclear content
+        return AnalyzedSection(
+            text=text,
+            content_type=ContentType.STATIC,
+            confidence=0.50,
+            reasoning="No strong dynamic indicators found",
+            position=position,
+        )
+
+    def _generate_section_placeholder(self, text: str) -> str:
+        """Generate a placeholder name for an LLM section"""
+        text_lower = text.lower()
+
+        if 'recommend' in text_lower:
+            return self._generate_unique_placeholder('recommendation')
+        elif 'assess' in text_lower or 'risk' in text_lower:
+            return self._generate_unique_placeholder('risk_assessment')
+        elif 'rational' in text_lower or 'reason' in text_lower:
+            return self._generate_unique_placeholder('rationale')
+        elif 'summar' in text_lower or 'overview' in text_lower:
+            return self._generate_unique_placeholder('summary')
+        elif 'circumstance' in text_lower or 'situation' in text_lower:
+            return self._generate_unique_placeholder('client_circumstances')
+        elif 'objective' in text_lower or 'goal' in text_lower:
+            return self._generate_unique_placeholder('objectives')
+        else:
+            return self._generate_unique_placeholder('dynamic_section')
+
+    def _generate_prompt_hint(self, text: str) -> str:
+        """Generate a hint for LLM prompt based on content"""
+        text_lower = text.lower()
+
+        if 'recommend' in text_lower:
+            return "Generate personalized recommendations based on client circumstances and objectives."
+        elif 'assess' in text_lower or 'risk' in text_lower:
+            return "Provide risk assessment based on client's risk profile and capacity for loss."
+        elif 'rational' in text_lower or 'reason' in text_lower:
+            return "Explain the reasoning behind recommendations, linking to client's situation."
+        elif 'summar' in text_lower or 'overview' in text_lower:
+            return "Provide executive summary of key points and recommendations."
+        elif 'circumstance' in text_lower or 'situation' in text_lower:
+            return "Describe client's current financial circumstances and objectives."
+        else:
+            return f"Generate appropriate content. Original sample: {text[:100]}..."
+
+    def generate_prompt_config(self, analysis: AnalysisResult) -> Dict:
+        """Generate configuration for LLM prompts based on analysis."""
         config = {
             "template_type": analysis.template_type,
             "placeholders": {},
+            "dynamic_values": [],
             "llm_sections": [],
-            "value_sections": [],
         }
 
+        # Add dynamic values
+        for dv in analysis.dynamic_values:
+            config["dynamic_values"].append({
+                "placeholder": dv.placeholder_name,
+                "type": dv.value_type,
+                "example": dv.original_text,
+                "context": dv.context,
+            })
+            config["placeholders"][dv.placeholder_name] = {
+                "type": dv.value_type,
+                "example": dv.original_text,
+                "prompt": f"Extract {dv.value_type} from input data (example: {dv.original_text})",
+            }
+
+        # Add LLM sections
         for section in analysis.sections:
-            if section.content_type == ContentType.DYNAMIC_LLM:
+            if section.content_type == ContentType.DYNAMIC_LLM and section.placeholder_name:
                 config["llm_sections"].append({
-                    "name": section.placeholder_name,
+                    "placeholder": section.placeholder_name,
                     "prompt_hint": section.prompt_hint,
                     "heading_context": section.heading_context,
-                    "original_text_sample": section.text[:200],
+                    "sample": section.text[:200],
                 })
                 config["placeholders"][section.placeholder_name] = {
-                    "type": "llm",
+                    "type": "llm_generated",
                     "prompt": section.prompt_hint,
-                }
-            elif section.content_type == ContentType.DYNAMIC_VALUE:
-                config["value_sections"].append({
-                    "name": section.placeholder_name,
-                    "value_type": section.value_type,
-                    "context": section.heading_context,
-                })
-                config["placeholders"][section.placeholder_name] = {
-                    "type": section.value_type,
-                    "prompt": f"Extract {section.value_type} from input data",
                 }
 
         return config
@@ -311,215 +637,13 @@ class TemplateAnalyzer:
 
     def _is_heading(self, para_xml: str, para_text: str) -> bool:
         """Check if a paragraph is a heading"""
-        # Check for heading style
         if re.search(r'<w:pStyle w:val="Heading\d?"', para_xml):
             return True
-
-        # Check for bold short text (likely heading)
-        if '<w:b/>' in para_xml or '<w:b ' in para_xml:
-            if len(para_text.strip()) < 100:
-                return True
-
-        # Check for all caps short text
+        if ('<w:b/>' in para_xml or '<w:b ' in para_xml) and len(para_text.strip()) < 100:
+            return True
         if para_text.isupper() and len(para_text.strip()) < 50:
             return True
-
         return False
-
-    def _analyze_paragraph(self, text: str, para_xml: str, position: int) -> AnalyzedSection:
-        """Analyze a single paragraph to classify it"""
-        text_lower = text.lower().strip()
-
-        # Check if under a known heading type
-        heading_influence = self._get_heading_influence()
-
-        # Score for static content
-        static_score = self._score_static(text_lower)
-
-        # Score for dynamic LLM content
-        llm_score = self._score_dynamic_llm(text_lower)
-
-        # Score for dynamic values
-        value_score, value_type = self._score_dynamic_value(text)
-
-        # Apply heading influence
-        if heading_influence == 'static':
-            static_score += 0.3
-        elif heading_influence == 'dynamic':
-            llm_score += 0.3
-
-        # Determine classification
-        if static_score > max(llm_score, value_score) and static_score > 0.3:
-            return AnalyzedSection(
-                text=text,
-                content_type=ContentType.STATIC,
-                confidence=min(0.95, static_score),
-                reasoning="Identified as static content (legal/boilerplate/header)",
-                position=position,
-            )
-        elif llm_score > value_score and llm_score > 0.3:
-            placeholder_name = self._generate_placeholder_name(text, 'llm')
-            prompt_hint = self._generate_prompt_hint(text)
-            return AnalyzedSection(
-                text=text,
-                content_type=ContentType.DYNAMIC_LLM,
-                confidence=min(0.9, llm_score),
-                placeholder_name=placeholder_name,
-                prompt_hint=prompt_hint,
-                reasoning="Identified as LLM-generated content (recommendations/assessments)",
-                position=position,
-            )
-        elif value_score > 0.3:
-            placeholder_name = self._generate_placeholder_name(text, value_type)
-            return AnalyzedSection(
-                text=text,
-                content_type=ContentType.DYNAMIC_VALUE,
-                confidence=min(0.9, value_score),
-                placeholder_name=placeholder_name,
-                value_type=value_type,
-                reasoning=f"Identified as dynamic value ({value_type})",
-                position=position,
-            )
-        else:
-            # Default to static if unclear
-            return AnalyzedSection(
-                text=text,
-                content_type=ContentType.STATIC,
-                confidence=0.5,
-                reasoning="Defaulted to static (no strong indicators)",
-                position=position,
-            )
-
-    def _score_static(self, text_lower: str) -> float:
-        """Score how likely this is static content"""
-        score = 0.0
-
-        for category, keywords in self.STATIC_INDICATORS.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    score += 0.2
-                    if score >= 0.8:
-                        return score
-
-        # Long paragraphs with no specific client references tend to be static
-        if len(text_lower) > 200:
-            has_client_ref = any(w in text_lower for w in ['you', 'your', 'client'])
-            if not has_client_ref:
-                score += 0.2
-
-        return min(1.0, score)
-
-    def _score_dynamic_llm(self, text_lower: str) -> float:
-        """Score how likely this needs LLM generation"""
-        score = 0.0
-
-        for category, keywords in self.DYNAMIC_LLM_INDICATORS.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    score += 0.15
-                    if score >= 0.8:
-                        return score
-
-        # Check for client-specific language
-        client_refs = ['you', 'your', 'client']
-        client_ref_count = sum(1 for ref in client_refs if ref in text_lower)
-        score += client_ref_count * 0.1
-
-        # Medium-length paragraphs with recommendations/assessments
-        if 50 < len(text_lower) < 500:
-            score += 0.1
-
-        return min(1.0, score)
-
-    def _score_dynamic_value(self, text: str) -> Tuple[float, Optional[str]]:
-        """Score how likely this contains dynamic values and identify type"""
-        # Check for currency
-        if re.search(r'[£$€]\s*[\d,]+(?:\.\d{2})?', text):
-            return 0.8, 'currency'
-
-        # Check for percentage
-        if re.search(r'\d+\.?\d*\s*%', text):
-            return 0.7, 'percentage'
-
-        # Check for date
-        if re.search(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', text):
-            return 0.8, 'date'
-        if re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}', text, re.I):
-            return 0.8, 'date'
-
-        # Check for name patterns with context
-        if re.search(r'(?:Client|Name|Dear|Mr\.|Mrs\.|Ms\.)[:\s]+[A-Z][a-z]+\s+[A-Z][a-z]+', text):
-            return 0.85, 'name'
-
-        # Check for reference numbers
-        if re.search(r'(?:Reference|Ref|Policy|Account)[:\s#]*[A-Z0-9\-]+', text, re.I):
-            return 0.7, 'reference'
-
-        # Check for email
-        if re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text):
-            return 0.9, 'email'
-
-        # Check for phone
-        if re.search(r'(?:\+44|0)\s*\d{2,4}\s*\d{3,4}\s*\d{3,4}', text):
-            return 0.75, 'phone'
-
-        return 0.0, None
-
-    def _get_heading_influence(self) -> Optional[str]:
-        """Get influence of current heading on content classification"""
-        if not self.current_heading:
-            return None
-
-        heading_lower = self.current_heading.lower()
-
-        for keyword in self.DYNAMIC_HEADINGS:
-            if keyword in heading_lower:
-                return 'dynamic'
-
-        for keyword in self.STATIC_HEADINGS:
-            if keyword in heading_lower:
-                return 'static'
-
-        return None
-
-    def _generate_placeholder_name(self, text: str, content_type: str) -> str:
-        """Generate a meaningful placeholder name"""
-        # Use heading context if available
-        if self.current_heading:
-            # Clean heading
-            name = re.sub(r'[^a-zA-Z\s]', '', self.current_heading.lower())
-            name = '_'.join(name.split()[:3])
-            if name:
-                return f"{name}_{content_type}"
-
-        # Extract key words from text
-        words = re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
-        important_words = [w for w in words[:5] if w not in
-                         ['this', 'that', 'with', 'from', 'your', 'have', 'been', 'will', 'would']]
-
-        if important_words:
-            return f"{'_'.join(important_words[:2])}_{content_type}"
-
-        return f"section_{content_type}"
-
-    def _generate_prompt_hint(self, text: str) -> str:
-        """Generate a hint for LLM prompt based on content"""
-        text_lower = text.lower()
-
-        if 'recommend' in text_lower:
-            return "Generate personalized investment/financial recommendations based on client circumstances and objectives."
-        elif 'assessment' in text_lower or 'risk' in text_lower:
-            return "Provide risk assessment and analysis based on client's risk profile and capacity for loss."
-        elif 'rationale' in text_lower or 'reason' in text_lower:
-            return "Explain the reasoning behind the recommendations, linking to client's specific situation."
-        elif 'summary' in text_lower or 'overview' in text_lower:
-            return "Provide executive summary of key points and recommendations."
-        elif 'circumstance' in text_lower or 'situation' in text_lower:
-            return "Describe client's current financial circumstances and objectives."
-        elif 'objective' in text_lower or 'goal' in text_lower:
-            return "Outline client's financial objectives and goals."
-        else:
-            return f"Generate appropriate content for this section. Original sample: {text[:100]}..."
 
     def _detect_template_type(self, full_text: str) -> str:
         """Detect the type of template"""
@@ -539,18 +663,6 @@ class TemplateAnalyzer:
             return 'fact_find'
         else:
             return 'general'
-
-    def _safe_replace(self, content: str, old_text: str, new_text: str) -> str:
-        """Safely replace text in XML content"""
-        # Escape the new text for XML
-        escaped_new = (new_text
-            .replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;')
-            .replace('"', '&quot;')
-            .replace("'", '&apos;'))
-
-        return content.replace(old_text, escaped_new)
 
 
 def create_template_analyzer():
